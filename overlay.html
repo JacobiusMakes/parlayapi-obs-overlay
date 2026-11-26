@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-feed="preview">
 <head>
 <meta charset="utf-8">
 <title>ParlayAPI Best Lines Overlay</title>
@@ -10,6 +10,7 @@
   to leak on stream. See README.md for setup and URL parameters.
 
   URL parameters:
+    mode   rehearsal = rotate fictional fixtures without a network request
     sport  nfl | nba | mlb | nhl | ncaaf | ncaab | wnba | epl | any sport_key (default: all sports)
     theme  dark | light (default: dark)
     speed  seconds each game stays on screen (default: 8, min 3)
@@ -95,7 +96,7 @@
     background: var(--accent);
     animation: pulse 1.8s ease-in-out infinite;
   }
-  #livedot.stale { background: #fbbf24; animation: none; }
+  #livedot.stale, #livedot.rehearsal { background: #fbbf24; animation: none; }
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.35; }
@@ -177,15 +178,15 @@
 <body>
   <div id="bar" role="marquee" aria-label="Live best betting lines">
     <div id="brand">
-      <div class="title"><span id="livedot"></span>BEST LINES</div>
+      <div class="title"><span id="livedot"></span><span id="mode-label">BEST LINES</span></div>
       <span id="sporttag">ALL SPORTS</span>
     </div>
     <div id="stage">
       <div id="empty">waiting for lines...</div>
     </div>
     <div id="attrib">
-      <span class="src">data: <b>parlay-api.com</b></span>
-      <span class="note">free live preview</span>
+      <span class="src">ParlayAPI</span>
+      <span class="note">Connecting to feed</span>
     </div>
   </div>
 
@@ -197,6 +198,7 @@
   var REFRESH_MS = 60000; // one request per minute: quota-polite by design
 
   var params = new URLSearchParams(window.location.search);
+  var rehearsal = document.documentElement.dataset.feed === "rehearsal" || params.get("mode") === "rehearsal";
   var sport = (params.get("sport") || "").trim();
   var theme = (params.get("theme") || "dark").toLowerCase();
   var speed = Math.max(3, parseFloat(params.get("speed")) || 8);
@@ -217,11 +219,12 @@
   var emptyEl = document.getElementById("empty");
   var sporttag = document.getElementById("sporttag");
   var livedot = document.getElementById("livedot");
+  var note = document.querySelector("#attrib .note");
 
   var games = [];
   var idx = 0;
   var currentCard = null;
-  var failCount = 0;
+  var refreshId = 0;
 
   function esc(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
@@ -247,8 +250,10 @@
   }
 
   function fmtTime(iso) {
+    if (!iso) return "";
     try {
       var d = new Date(iso);
+      if (isNaN(d.getTime())) return "";
       var day = d.toLocaleDateString(undefined, { weekday: "short" });
       var t = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
       return day + " " + t;
@@ -308,16 +313,19 @@
   }
 
   function applyData(data) {
-    var list = (data && data.games) || [];
+    if (!data || !Array.isArray(data.games)) throw new Error("Missing games array");
+    var list = data.games;
     var usable = [];
     for (var i = 0; i < list.length; i++) {
       var g = list[i];
-      if (g && (g.best_home || g.best_away)) usable.push(g);
+      if (g && ((g.best_home && Number.isFinite(g.best_home.price)) ||
+                (g.best_away && Number.isFinite(g.best_away.price)))) usable.push(g);
       if (usable.length >= maxGames) break;
     }
-    var hadGames = games.length > 0;
     games = usable;
-    if (sport) {
+    if (rehearsal) {
+      sporttag.textContent = "SAMPLE DATA";
+    } else if (sport) {
       sporttag.textContent = sport.slice(0, 18).toUpperCase();
     } else if (data && data.sport) {
       sporttag.textContent = String(data.sport).replace(/^[a-z]+_/, "").slice(0, 18).toUpperCase();
@@ -325,35 +333,59 @@
       sporttag.textContent = "ALL SPORTS";
     }
     emptyEl.style.display = games.length ? "none" : "flex";
-    if (!hadGames && games.length) {
-      idx = 0;
+    if (games.length) {
       showNext();
+    } else {
+      stage.querySelectorAll(".card").forEach(function (card) { card.remove(); });
+      currentCard = null;
+      idx = 0;
+      emptyEl.textContent = "No lines in this feed";
     }
   }
 
   function refresh() {
+    var id = ++refreshId;
+    var controller = new AbortController();
+    var timeout = setTimeout(function () { controller.abort(); }, 15000);
     var url = API_BASE + (sport ? "?sport=" + encodeURIComponent(sport) : "");
-    fetch(url, { cache: "no-store" })
+    fetch(url, { cache: "no-store", signal: controller.signal })
       .then(function (r) {
         if (!r.ok) throw new Error("http " + r.status);
         return r.json();
       })
       .then(function (data) {
-        failCount = 0;
-        livedot.classList.remove("stale");
+        if (id !== refreshId) return;
         applyData(data);
+        livedot.classList.remove("stale");
+        note.textContent = games.length ? "Public preview" : "Feed checked";
       })
       .catch(function (err) {
-        failCount++;
-        // stay quiet on stream: keep last good data, dim the dot after repeated misses
-        if (failCount >= 3) livedot.classList.add("stale");
+        if (id !== refreshId) return;
+        livedot.classList.add("stale");
+        note.textContent = games.length ? "Cached · refresh failed" : "Feed unavailable";
         console.warn("ParlayAPI overlay fetch failed:", err && err.message);
-      });
+      })
+      .finally(function () { clearTimeout(timeout); });
   }
 
   bar.classList.add("ready");
-  refresh();
-  setInterval(refresh, REFRESH_MS);
+  if (rehearsal) {
+    document.getElementById("mode-label").textContent = "REHEARSAL";
+    bar.setAttribute("aria-label", "Rehearsal ticker with fictional teams and prices");
+    livedot.classList.add("rehearsal");
+    note.textContent = "Fictional teams and prices";
+    applyData({ games: [
+      { away_team: "Harbor Owls", home_team: "Valley Foxes", sport_title: "Practice basketball", book_count: 2,
+        best_away: { price: 125, bookmaker: "Fieldstone" }, best_home: { price: -135, bookmaker: "Northline" } },
+      { away_team: "Cedar Kites", home_team: "Coastal Lynx", sport_title: "Practice hockey", book_count: 2,
+        best_away: { price: -110, bookmaker: "Northline" }, best_home: { price: 105, bookmaker: "Fieldstone" } },
+      { away_team: "Ridge Comets", home_team: "Lake Herons", sport_title: "Practice baseball", book_count: 1,
+        best_away: { price: 115, bookmaker: "Fieldstone" }, best_home: { price: -125, bookmaker: "Fieldstone" } }
+    ] });
+  } else {
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  }
   setInterval(showNext, speed * 1000);
 })();
 </script>
